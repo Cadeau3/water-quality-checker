@@ -1,0 +1,375 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Water Quality Checker & Contamination Predictor</title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&display=swap" rel="stylesheet">
+  <style>
+    :root{
+      --bg:#071021; --panel:rgba(255,255,255,0.03); --muted:#9aa4b2; --accent:#2fa4c6;
+      --alert:#ff7043; --ok:#6ad17b;
+    }
+    html,body{height:100%;margin:0;background:linear-gradient(180deg,#06121a,#071021);font-family:Inter,system-ui,Arial;color:#fff}
+    .wrap{max-width:1100px;margin:18px auto;padding:18px}
+    header{display:flex;gap:12px;align-items:center}
+    h1{margin:0;font-size:20px}
+    .panel{background:var(--panel);padding:12px;border-radius:10px;border:1px solid rgba(255,255,255,0.04)}
+    .controls{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:10px}
+    input[type=file], select, input, button {background:transparent;border:1px solid rgba(255,255,255,0.06);color:#fff;padding:8px;border-radius:8px;min-height:36px}
+    button.btn{background:var(--accent);border:0;cursor:pointer}
+    table{width:100%;border-collapse:collapse;margin-top:8px}
+    th,td{padding:8px;border-bottom:1px solid rgba(255,255,255,0.03);font-size:13px}
+    .small{font-size:13px;color:var(--muted)}
+    #main{display:grid;grid-template-columns:360px 1fr;gap:12px;margin-top:12px}
+    canvas{background:transparent;border-radius:8px}
+    @media(max-width:980px){#main{grid-template-columns:1fr}}
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.3.0/dist/chart.umd.min.js"></script>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <div style="width:56px;height:56px;border-radius:10px;background:linear-gradient(135deg,#154b57,#0a2b35);display:flex;align-items:center;justify-content:center;font-weight:700">WQ</div>
+      <div>
+        <h1>Water Quality Checker & Contamination Predictor</h1>
+        <div class="small">Detect potential contamination risks using pH, turbidity, conductivity and rainfall — demo data included.</div>
+      </div>
+    </header>
+
+    <div class="panel" style="margin-top:12px">
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <div><strong>Data & Controls</strong><div class="small">Upload CSV or use demo data. CSV columns: <code>site,month,pH,turbidity,conductivity,rainfall</code></div></div>
+        <div style="display:flex;gap:8px;align-items:center">
+          <input id="csvInput" type="file" accept=".csv"/>
+          <button id="demoBtn" class="btn">Load Demo</button>
+          <button id="resetBtn" class="btn">Reset</button>
+        </div>
+      </div>
+
+      <div class="controls">
+        <label class="small">From</label><input type="month" id="fromMonth"/>
+        <label class="small">To</label><input type="month" id="toMonth"/>
+        <label class="small">Risk sensitivity</label>
+        <select id="sensitivity">
+          <option value="1.0">Default</option>
+          <option value="0.8">Lower (more sensitive)</option>
+          <option value="1.2">Higher (less sensitive)</option>
+        </select>
+        <button id="applyBtn" class="btn">Apply</button>
+        <button id="exportCSV" class="btn">Export CSV</button>
+      </div>
+    </div>
+
+    <div id="main">
+      <div>
+        <div class="panel">
+          <strong>Sites & Risk</strong>
+          <div class="small">Click a site to see its trend and risk details.</div>
+          <table id="sitesTable">
+            <thead><tr><th>Site</th><th>Risk</th><th></th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+
+        <div class="panel" style="margin-top:10px">
+          <strong>Data preview (sample)</strong>
+          <pre id="preview" style="white-space:pre-wrap;max-height:180px;overflow:auto" class="small"></pre>
+        </div>
+      </div>
+
+      <div>
+        <div class="panel">
+          <strong id="selTitle">Select a site</strong>
+          <div class="small" id="selSummary">No site selected</div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:10px">
+            <div><canvas id="pHChart" height="220"></canvas></div>
+            <div><canvas id="turbChart" height="220"></canvas></div>
+          </div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:10px">
+            <div><canvas id="condChart" height="160"></canvas></div>
+            <div><canvas id="riskChart" height="160"></canvas></div>
+          </div>
+        </div>
+
+        <div class="panel" style="margin-top:10px">
+          <strong>Risk Rules (simple heuristic)</strong>
+          <ul class="small">
+            <li>pH outside 6.5–8.5 increases risk.</li>
+            <li>Turbidity &gt; 5 NTU raises contamination likelihood.</li>
+            <li>Conductivity &gt; 800 µS/cm indicates pollution/runoff.</li>
+            <li>Recent heavy rainfall (same month) multiplies risk.</li>
+            <li>Combined score → Low / Moderate / High risk.</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+<script>
+/* ===== Helpers & State ===== */
+function round2(x){ return Math.round(x*100)/100; }
+function downloadDataUrl(dataUrl, fileName){ const a=document.createElement('a'); a.href=dataUrl; a.download=fileName; document.body.appendChild(a); a.click(); a.remove(); }
+
+const MONTHS = (()=>{ const arr=[]; let d=new Date(2023,0,1); for(let i=0;i<24;i++){ const dd=new Date(d.getFullYear(), d.getMonth()+i,1); arr.push(dd.toISOString().slice(0,7)); } return arr; })();
+
+let DATA = {}; // {site: [{month,pH,turbidity,conductivity,rainfall}]}
+let selectedSite = null;
+
+const csvInput = document.getElementById('csvInput');
+const demoBtn = document.getElementById('demoBtn');
+const resetBtn = document.getElementById('resetBtn');
+const preview = document.getElementById('preview');
+const sitesTbody = document.querySelector('#sitesTable tbody');
+const selTitle = document.getElementById('selTitle');
+const selSummary = document.getElementById('selSummary');
+
+const fromMonthEl = document.getElementById('fromMonth');
+const toMonthEl = document.getElementById('toMonth');
+const applyBtn = document.getElementById('applyBtn');
+const sensitivityEl = document.getElementById('sensitivity');
+const exportCSV = document.getElementById('exportCSV');
+
+/* ===== Simple CSV parser ===== */
+function parseCSV(text){
+  const lines = text.trim().split(/\r?\n/).filter(Boolean);
+  if(lines.length<2) return [];
+  const headers = lines[0].split(',').map(h=>h.trim().toLowerCase());
+  return lines.slice(1).map(line=>{
+    const vals = line.split(',').map(s=>s.trim());
+    const obj = {};
+    headers.forEach((h,i)=> obj[h]= vals[i] || '');
+    return obj;
+  });
+}
+
+/* ===== Synthetic demo data ===== */
+const DEMO_SITES = [
+  {site:'Nakuru River', lat: -0.3031, lon: 36.0800},
+  {site:'Nairobi Well', lat: -1.2921, lon: 36.8219},
+  {site:'Kisumu Intake', lat: -0.0917, lon: 34.7680},
+  {site:'Mombasa Port', lat: -4.0435, lon: 39.6682}
+];
+
+function generateDemo(){
+  const data = {};
+  for(const s of DEMO_SITES){
+    let basePH = 7 + (Math.random()-0.5)*0.6;
+    let baseT = 3 + Math.random()*4; // NTU
+    let baseC = 200 + Math.random()*600; // µS/cm
+    const rows = [];
+    for(let i=0;i<MONTHS.length;i++){
+      const month = MONTHS[i];
+      // seasonal rainfall
+      const seasonal = 60 * Math.sin((i/12)*Math.PI*2) + 80;
+      let rainfall = Math.max(0, seasonal*0.6 + (Math.random()-0.5)*50);
+      // occasional heavy rain spike
+      if(Math.random()<0.15) rainfall *= (1 + Math.random()*2);
+      const turb = Math.max(0.5, baseT + (Math.random()-0.5)*3 + (rainfall>150? 3:0));
+      const cond = Math.max(50, baseC + (Math.random()-0.5)*200 + (rainfall>150? 150:0));
+      const ph = round2(basePH + (Math.random()-0.5)*0.6 + (rainfall>150? -0.2:0));
+      rows.push({month,pH:ph,turbidity:round2(turb),conductivity:round2(cond),rainfall:round2(rainfall)});
+    }
+    data[s.site] = rows;
+  }
+  return data;
+}
+
+/* ===== Transform CSV rows to DATA ===== */
+function loadFromRows(rows){
+  const newData = {};
+  rows.forEach(r=>{
+    const site = r.site || r.location || r.name;
+    const month = r.month;
+    if(!site || !month) return;
+    const pH = parseFloat(r.ph || r.pH || r['pH'] || r.pH) || NaN;
+    const turb = parseFloat(r.turbidity || r.turb) || NaN;
+    const cond = parseFloat(r.conductivity || r.cond) || NaN;
+    const rain = parseFloat(r.rainfall || r.rain) || 0;
+    if(!newData[site]) newData[site]=[];
+    newData[site].push({month, pH: isFinite(pH)? round2(pH): null, turbidity: isFinite(turb)? round2(turb): null, conductivity: isFinite(cond)? round2(cond): null, rainfall: round2(rain)});
+  });
+  // sort months
+  Object.keys(newData).forEach(k => newData[k].sort((a,b)=> a.month.localeCompare(b.month)));
+  DATA = newData;
+}
+
+/* ===== Risk heuristic =====
+   Score components (higher = more risk)
+   - pH deviation: ideal 6.5-8.5 => score = normalized deviation
+   - turbidity: >5 raises score
+   - conductivity: >800 raises score
+   - rainfall multiplier: heavy rainfall increases risk
+   sensitivity multiplier modifies thresholds
+*/
+function computeRiskForRow(row, sensitivity=1.0){
+  let score = 0;
+  // pH deviation
+  if(row.pH != null){
+    if(row.pH < 6.5) score += (6.5 - row.pH) * 1.5;
+    if(row.pH > 8.5) score += (row.pH - 8.5) * 1.5;
+  }
+  // turbidity
+  if(row.turbidity != null){
+    if(row.turbidity > 5) score += (row.turbidity - 5) * 0.6;
+  }
+  // conductivity
+  if(row.conductivity != null){
+    if(row.conductivity > 800) score += (row.conductivity - 800) / 200;
+  }
+  // rainfall multiplier (recent heavy rain)
+  const rainMult = (row.rainfall && row.rainfall > 120) ? 1.5 : 1.0;
+  score = score * rainMult;
+  // sensitivity adjustment
+  score = score / sensitivity;
+  return round2(score);
+}
+
+function labelRisk(score){
+  if(isNaN(score)) return 'No data';
+  if(score >= 6) return 'High';
+  if(score >= 2.5) return 'Moderate';
+  if(score > 0) return 'Low';
+  return 'Low';
+}
+
+/* ===== UI & Charts ===== */
+let phChart, turbChart, condChart, riskChart;
+
+function updateSitesTable(){
+  sitesTbody.innerHTML = '';
+  const from = fromMonthEl.value || MONTHS[0];
+  const to = toMonthEl.value || MONTHS[MONTHS.length-1];
+  const sens = parseFloat(sensitivityEl.value);
+  for(const site of Object.keys(DATA)){
+    const rows = DATA[site].filter(r=> r.month >= from && r.month <= to);
+    if(rows.length===0) continue;
+    // compute mean risk across selected range
+    const scores = rows.map(r => computeRiskForRow(r, sens));
+    const meanScore = scores.reduce((a,b)=>a+b,0)/scores.length;
+    const label = labelRisk(meanScore);
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td style="font-weight:600">${site}</td><td>${label} (${round2(meanScore)})</td><td style="text-align:right"><button data-site="${site}" class="btn">View</button></td>`;
+    sitesTbody.appendChild(tr);
+  }
+  // attach view buttons
+  sitesTbody.querySelectorAll('button[data-site]').forEach(b=>{
+    b.onclick = ()=> selectSite(b.getAttribute('data-site'));
+  });
+}
+
+function selectSite(site){
+  selectedSite = site;
+  selTitle.textContent = site;
+  const from = fromMonthEl.value || MONTHS[0];
+  const to = toMonthEl.value || MONTHS[MONTHS.length-1];
+  const sens = parseFloat(sensitivityEl.value);
+  const rows = (DATA[site] || []).filter(r=> r.month >= from && r.month <= to);
+  preview.innerText = JSON.stringify(rows.slice(0,24), null, 2);
+
+  // summary
+  const scores = rows.map(r=> computeRiskForRow(r,sens));
+  const meanScore = scores.length ? round2(scores.reduce((a,b)=>a+b,0)/scores.length) : NaN;
+  selSummary.innerText = `Average risk score: ${isNaN(meanScore)? '—' : meanScore} | Points: pH, turbidity, conductivity, rainfall`;
+
+  const labels = rows.map(r=> r.month);
+  const pHvals = rows.map(r=> r.pH);
+  const turbvals = rows.map(r=> r.turbidity);
+  const condvals = rows.map(r=> r.conductivity);
+  const riskvals = rows.map(r=> computeRiskForRow(r,sens));
+
+  // pH chart
+  if(phChart) phChart.destroy();
+  phChart = new Chart(document.getElementById('pHChart'), {
+    type:'line', data:{ labels, datasets:[
+      {label:'pH', data:pHvals, borderColor:'#4ea3ff', tension:0.25}
+    ]}, options:{responsive:true, maintainAspectRatio:false, scales:{y:{min:4,max:10}}}
+  });
+
+  // turbidity
+  if(turbChart) turbChart.destroy();
+  turbChart = new Chart(document.getElementById('turbChart'), {
+    type:'line', data:{ labels, datasets:[
+      {label:'Turbidity (NTU)', data:turbvals, borderColor:'#f3a261', tension:0.25}
+    ]}, options:{responsive:true, maintainAspectRatio:false}
+  });
+
+  // conductivity
+  if(condChart) condChart.destroy();
+  condChart = new Chart(document.getElementById('condChart'), {
+    type:'line', data:{ labels, datasets:[
+      {label:'Conductivity (µS/cm)', data:condvals, borderColor:'#8ec5ff', tension:0.25}
+    ]}, options:{responsive:true, maintainAspectRatio:false}
+  });
+
+  // risk chart (bar)
+  if(riskChart) riskChart.destroy();
+  riskChart = new Chart(document.getElementById('riskChart'), {
+    type:'bar', data:{ labels, datasets:[
+      {label:'Risk score', data:riskvals, backgroundColor:riskvals.map(v=> v>=6? '#ff7043': v>=2.5? '#ffb84d': '#6ad17b')}
+    ]}, options:{responsive:true, maintainAspectRatio:false}
+  });
+}
+
+/* ===== CSV upload handler ===== */
+csvInput.addEventListener('change', (e)=>{
+  const f = e.target.files[0];
+  if(!f) return;
+  const reader = new FileReader();
+  reader.onload = ev=>{
+    try{
+      const rows = parseCSV(ev.target.result);
+      if(rows.length===0) throw new Error('Empty CSV');
+      loadFromRows(rows);
+      // set months
+      const monthsSet = new Set(Object.values(DATA).flat().map(r=> r.month));
+      const monthsArr = Array.from(monthsSet).sort();
+      fromMonthEl.value = monthsArr[0] || MONTHS[0];
+      toMonthEl.value = monthsArr[monthsArr.length-1] || MONTHS[MONTHS.length-1];
+      updateSitesTable();
+      preview.innerText = 'Loaded CSV for ' + Object.keys(DATA).length + ' sites.';
+    }catch(err){ alert('CSV load failed: ' + err.message); }
+  };
+  reader.readAsText(f);
+});
+
+/* ===== Demo, reset, apply, export ===== */
+demoBtn.onclick = ()=>{
+  DATA = generateDemo();
+  fromMonthEl.value = MONTHS[0];
+  toMonthEl.value = MONTHS[MONTHS.length-1];
+  updateSitesTable();
+  preview.innerText = 'Demo data loaded for ' + Object.keys(DATA).length + ' sites.';
+};
+
+resetBtn.onclick = ()=>{ DATA = {}; preview.innerText = 'Cleared data.'; sitesTbody.innerHTML=''; selTitle.textContent='Select a site'; selSummary.textContent='No site selected'; };
+
+applyBtn.onclick = ()=>{ updateSitesTable(); if(selectedSite) selectSite(selectedSite); };
+
+exportCSV.onclick = ()=>{
+  const from = fromMonthEl.value || MONTHS[0];
+  const to = toMonthEl.value || MONTHS[MONTHS.length-1];
+  let csv = 'site,month,pH,turbidity,conductivity,rainfall\n';
+  for(const site of Object.keys(DATA)){
+    for(const r of DATA[site].filter(x=> x.month >= from && x.month <= to)){
+      csv += `${site},${r.month},${r.pH || ''},${r.turbidity || ''},${r.conductivity || ''},${r.rainfall || ''}\n`;
+    }
+  }
+  const blob = new Blob([csv], {type:'text/csv'});
+  const url = URL.createObjectURL(blob);
+  downloadDataUrl(url, `water_quality_${from}_to_${to}.csv`);
+  setTimeout(()=>URL.revokeObjectURL(url), 3000);
+};
+
+/* ===== Init ===== */
+window.addEventListener('load', ()=>{
+  // default demo
+  DATA = generateDemo();
+  fromMonthEl.value = MONTHS[0];
+  toMonthEl.value = MONTHS[MONTHS.length-1];
+  updateSitesTable();
+});
+</script>
+</body>
+</html>
